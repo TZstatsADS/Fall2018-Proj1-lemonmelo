@@ -1,0 +1,789 @@
+---
+title: "FinalProject_ym2630"
+author: "Yizhou (Alice) Mi ym2630"
+date: "2018/6/30"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+
+---
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Translating from Python to R from https://www.kaggle.com/powderist/happydb-analysis
+
+```{r echo=FALSE,message= FALSE}
+# Loading all the necessary packages
+Sys.setenv(TZ="America/New_York")
+install.packages(c("ngram","tm","wordcloud","caret","ggplot2",
+                   "glmnet", "text2vec","data.table","magrittr",
+                   "MASS","e1071","rpart","randomForest",
+                   "doParallel","class","fastAdaboost"))
+install.packages("SnowballC")
+library(ngram)
+library(tm)
+library(wordcloud)
+library(caret)
+library(ggplot2)
+library(glmnet)
+library(text2vec)
+library(data.table)
+library(magrittr)
+library(MASS)
+library(e1071)
+library(rpart)
+library(randomForest)
+library(doParallel) # <- To Run script in parallel
+library(class)
+library(fastAdaboost)
+library(SnowballC)
+
+registerDoParallel(cores=5)
+
+theme_update(plot.title = element_text(hjust = 0.5)) # Center-align ggplot title
+```
+# Data Integration and Cleaning
+```{r}
+# Read in Raw Data
+hm_data <- read.csv("cleaned_hm.csv", stringsAsFactors = FALSE)
+demo_data <- read.csv("demographic.csv")
+
+sprintf("hm data has %s rows,%s cols", dim(hm_data)[1],dim(hm_data)[2])
+sprintf("Demographic data has %s rows,%s cols", dim(demo_data)[1],dim(demo_data)[2])
+
+# Merge demo data based on wid column
+hm_data = merge(hm_data,demo_data,by = "wid")
+sprintf("Merged data has %s rows,%s cols", dim(hm_data)[1],dim(hm_data)[2])
+hm_data = subset(hm_data, gender %in% c("f","m")) # Only keep F and M as gender
+sprintf("Subsetted data has %s rows,%s cols", dim(hm_data)[1],dim(hm_data)[2])
+```
+
+```{r}
+count <- sapply(hm_data$cleaned_hm, wordcount) # Counts number of words
+summary(count)
+```
+
+```{r}
+category <- c("0-4","5-9","10-14","15-19","20-24","25-29","30-34","35-39",
+              "40-44","45-49",">=50")
+count_class <- cut(count, breaks = c(0,4,9,14,19,24,29,34,39,44,49,Inf), 
+                   labels = category, include.lowest = TRUE)
+ggplot()+
+  geom_bar(aes(x = count_class, fill = count_class))+
+  ylim(0,30000)+
+  labs(x = "Word Count", y = "Number of Happy Moments", 
+       title = "Word Count Distribution")+
+  guides(fill = "none")
+```
+
+# Word Frequency
+
+```{r}
+set.seed(0)
+n = 15000 # sample size
+random_hm <- sample(1:nrow(hm_data), n) # Working with only a random subset
+hm_subset <- hm_data[random_hm,] # <- All analysis will be done on this subset
+gender <- hm_subset$gender
+hm_subset$gender_int <- as.factor(ifelse(gender == "m",1,0))
+
+corpus    <- Corpus(VectorSource(hm_subset$cleaned_hm))
+skipWords <- function(x) removeWords(x, words = c(stopwords(kind = "en")))
+funcs <- list(stripWhitespace,stemDocument,skipWords, removeNumbers, removePunctuation, tolower)
+?tm_map
+a         <- tm_map(corpus, FUN = tm_reduce, tmFuns = funcs)
+a_dtm     <- DocumentTermMatrix(a)
+m         <- as.data.frame(as.matrix(a_dtm))
+v         <- sort(colSums(m), decreasing = TRUE)
+d         <- data.frame(word = names(v), freq = v)
+``` 
+
+```{r}
+# Word cloud
+options(warn=-1)
+wordcloud(words = d$word, freq = d$freq, colors = brewer.pal(8, "Dark2"), 
+          random.order = FALSE, min.freq = 5,scale=c(4,.5),max.words=300)
+```
+
+```{r}
+# Extra - Bar chart of high frequency words
+barplot(height = d$freq[d$freq %in% 500:max(d$freq)], 
+        names.arg = d$word[d$freq %in% 500:max(d$freq)], 
+        horiz = TRUE, col = "orange", las = 2, cex.names = 0.7,
+        main = "Words with frequency more than 500")
+```
+
+# Check whether high frequency words are noise
+```{r}
+# Check whether high frequency data is noise data
+agg1 = aggregate(. ~ hm_subset$gender, m[,as.character(d$word[d$freq >= 500])],sum)
+f_ratio = agg1[1,-1] / colSums(agg1[,-1])
+m_ratio = agg1[2,-1] / colSums(agg1[,-1])
+
+ratio = rbind(f_ratio,m_ratio)
+ratio
+
+# High Frequency Words that can be predictive about gender 
+ratio[,ratio[1,] < 0.45 | ratio[1,] > 0.55]
+
+# Noise words
+ratio[,ratio[1,] >= 0.45 & ratio[1,] <= 0.55]
+skipwords = colnames(ratio[,ratio[1,] >= 0.45 & ratio[1,] <= 0.55])
+```
+Woman tends to be more expressive about their feelings.
+```{r}
+# Check whether word length differ by gender
+ggplot(hm_subset, aes(x = nchar(cleaned_hm), fill = gender)) +
+  xlim(0,500) +
+  theme_bw() +
+  geom_histogram(binwidth = 5) +
+  labs(y = "Text Count", x = "Length of Text",
+       title = "Distribution of Text Lengths Less Than 500 with Class Labels")
+
+```
+
+# Removing noise words
+
+```{r}
+# Filter out noise words
+new_a         <- tm_map(a,removeWords, words = c(stopwords(kind = "en"),skipwords))
+new_a_dtm     <- DocumentTermMatrix(new_a)
+new_m         <- as.matrix(new_a_dtm)
+new_v         <- sort(colSums(new_m), decreasing = TRUE)
+new_d         <- data.frame(word = names(new_v), freq = new_v)
+```
+
+```{r}
+# Word cloud after stripping extra skipwords 
+wordcloud(words = new_d$word, freq = new_d$freq, colors = brewer.pal(8, "Dark2"), 
+          random.order = FALSE, min.freq = 5,max.words = 300,scale=c(4,.5))
+```
+
+```{r}
+# Extra - High frequency words after stripping unnecessary words
+barplot(height = new_d$freq[new_d$freq %in% 500:max(new_d$freq)], 
+        names.arg = new_d$word[new_d$freq %in% 500:max(new_d$freq)], 
+        horiz = TRUE, col = "orange", las = 2, cex.names = 0.7,
+        main = "Words with frequency more than 500")
+```
+
+# Generalized Linear Models with Lasso Penalty with gender
+
+
+```{r}
+# Quick visualization of distribution of gender
+barplot(table(hm_subset$gender))
+```
+
+```{r}
+# First 70% as training data, rest 30% as test data. 
+# 5-fold cross validation done later in the training set
+# Sample train id
+train_id <- sample(1:dim(hm_subset)[1],dim(hm_subset)[1] * 0.7)
+
+# Filter out infrequent words
+new_a_dtm <- removeSparseTerms(new_a_dtm, 0.999)
+dtm <- as.data.frame(as.matrix(new_a_dtm))
+dtm$gender_int = hm_subset$gender_int
+
+sprintf("Subsetted data has %s rows,%s cols", dim(dtm)[1],dim(dtm)[2])
+
+
+dtm_train <- dtm[train_id, ]
+dtm_test <- dtm[-train_id, ]
+
+train_X <- dtm_train[,!colnames(dtm_train) %in% c("gender_int")]
+test_X <- dtm_test[,!colnames(dtm_test) %in% c("gender_int")]
+
+train_Y <- dtm_train$gender_int
+test_Y <- dtm_test$gender_int
+```
+
+```{r}
+# Use PCA to reduce dimensionality
+start_time = Sys.time()
+pca = preProcess(x = train_X, method = 'pca', thresh = 0.95)
+pca_train = predict(pca, train_X)
+pca_test = predict(pca, test_X)
+
+end_time = Sys.time()
+# Processing Time
+end_time - start_time
+
+sprintf("PCA train has %s rows,%s cols", dim(pca_train)[1],dim(pca_train)[2])
+sprintf("PCA test has %s rows,%s cols", dim(pca_test)[1],dim(pca_test)[2])
+```
+
+```{r}
+# Creating 5 Folds Training and Testing ids
+flds <- createFolds(1:dim(train_X)[1], k = 5, list = TRUE, returnTrain = FALSE)
+
+# Create Result Holder
+result = NULL
+# Store Predicted Y value
+Ypreds = NULL
+
+# Voting function based on predicted results
+vote = function(pred_dataframe){
+  for(i in 1:dim(pred_dataframe)[2]){
+    pred_dataframe[,i] = as.numeric(as.character(pred_dataframe[,i]))
+  }
+  votes = rowSums(pred_dataframe)
+  votes = votes / dim(pred_dataframe)[2]
+  final_vote = ifelse(votes > 0.5,1,0)
+  return(final_vote)
+}
+
+
+```
+
+## Logistic regression with Lasso Penalty
+
+```{r}
+# Fitting the classifier using logistic regression
+start_time = Sys.time()
+lg_classifier <- cv.glmnet(x = as.matrix(train_X), y = train_Y,
+                     family = 'binomial', alpha = 1, type.measure = "class",
+                     nfolds = 5, thresh = 1e-3, maxit = 1e3)
+plot(lg_classifier)
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+
+```{r}
+# Evaluating the performance of our classifier on test data
+preds <- predict(lg_classifier, as.matrix(train_X), type = "class")
+train_accuracy <- sum(preds == train_Y,1,0) / length(train_Y)
+
+preds <- predict(lg_classifier, as.matrix(test_X), type = "class")
+Ypreds = data.frame(glm_full = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = data.frame(type = "Glmnet",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F)
+
+sprintf("Glmnet With LASSO Penalty")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+```{r}
+# Fitting the classifier using logistic regression
+start_time = Sys.time()
+lg_classifier_pca <- cv.glmnet(x = as.matrix(pca_train), y = train_Y,
+                     family = 'binomial', alpha = 1, type.measure = "class",
+                     nfolds = 5, thresh = 1e-3, maxit = 1e3)
+plot(lg_classifier_pca)
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+```{r}
+# Evaluating the performance of our classifier on test data
+preds <- predict(lg_classifier_pca, as.matrix(pca_train), type = "class")
+train_accuracy <- sum(preds == train_Y,1,0) / length(train_Y)
+
+preds <- predict(lg_classifier_pca, as.matrix(pca_test), type = "class")
+Ypreds = data.frame(Ypreds,glm_pca = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Glmnet",var = "PCA",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Glmnet With LASSO Penalty and PCA")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+## Linear Discriminant Analysis after PCA
+LDA complains about muticolinearity issue, so we only fit PCA version.
+
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation on LDA after PCA
+
+cv_orig = NULL
+cv_pred = NULL
+lda_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "MASS") %dopar%{
+  train_Fold = pca_train[-flds[[i]],]
+  cv_Fold = pca_train[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+  
+lda = lda(formula = train_Y[-flds[[i]]] ~ ., data = train_Fold)
+
+# Predict cross validation part
+preds = as.data.frame(predict(lda, cv_Fold))$class
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+
+# Get testing prediction
+preds = as.data.frame(predict(lda, pca_test))$class
+list(cv_orig = cv_orig, cv_pred = cv_pred, lda_pred = as.numeric(as.character(preds)))
+}
+
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(lda_preds)){
+    lda_preds = res[[i]]$lda_pred
+  }else{
+    lda_preds = cbind(lda_preds,res[[i]]$lda_pred)
+  }
+}
+
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(lda_preds)
+Ypreds = data.frame(Ypreds,lda_pca = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "LDA",var = "PCA",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Linear Discriminant Analysis with PCA")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+## Decision Tree
+Decision Tree
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Decision Tree model
+
+cv_orig = NULL
+cv_pred = NULL
+tree_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "rpart") %dopar%{
+  train_Fold = train_X[-flds[[i]],]
+  cv_Fold = train_X[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+
+tree = rpart(formula = train_Y[-flds[[i]]] ~ ., data = train_Fold)
+
+# Predict cross validation part
+preds = predict(tree, cv_Fold,type = "class")
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+
+# Get testing prediction
+preds = predict(tree, test_X,type = "class")
+preds = as.numeric(as.character(preds))
+
+list(cv_orig = cv_orig, cv_pred = cv_pred, tree_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(tree_preds)){
+    tree_preds = res[[i]]$tree_preds
+  }else{
+    tree_preds = cbind(tree_preds,res[[i]]$tree_preds)
+  }
+}
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(tree_preds)
+Ypreds = data.frame(Ypreds,tree = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Tree",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Decision Tree")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+# Decision Tree with PCA
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Decision Tree model
+
+cv_orig = NULL
+cv_pred = NULL
+tree_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "rpart") %dopar%{
+  train_Fold = pca_train[-flds[[i]],]
+  cv_Fold = pca_train[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+
+tree = rpart(formula = train_Y[-flds[[i]]] ~ ., data = train_Fold)
+
+# Predict cross validation part
+preds = predict(tree, cv_Fold,type = "class")
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+# Get testing prediction
+preds = predict(tree, pca_test,type = "class")
+preds = as.numeric(as.character(preds))
+
+list(cv_orig = cv_orig, cv_pred = cv_pred, tree_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(tree_preds)){
+    tree_preds = res[[i]]$tree_preds
+  }else{
+    tree_preds = cbind(tree_preds,res[[i]]$tree_preds)
+  }
+}
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(tree_preds)
+Ypreds = data.frame(Ypreds,tree = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Decision Tree",var = "PCA",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Decision Tree with PCA")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+## Naive Bayes
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Naive Bayes
+cv_orig = NULL
+cv_pred = NULL
+nb_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "e1071") %dopar%{
+  print(i)
+  train_Fold = train_X[-flds[[i]],]
+  cv_Fold = train_X[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+
+naiveBayes = naiveBayes(formula = train_Y[-flds[[i]]] ~ ., data = train_Fold)
+
+# Predict cross validation part
+preds = predict(naiveBayes, cv_Fold,type = "class", threshold = 0.01)
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+# Get testing prediction
+preds = predict(naiveBayes, test_X,type = "class",threshold = 0.01)
+preds = as.numeric(as.character(preds))
+
+list(cv_orig = cv_orig, cv_pred = cv_pred, nb_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(tree_preds)){
+    nb_preds = res[[i]]$nb_preds
+  }else{
+    nb_preds = cbind(nb_preds,res[[i]]$nb_preds)
+  }
+}
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(nb_preds)
+Ypreds = data.frame(Ypreds,nb = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Naive Bayes",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Naive Bayes")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+# Naive Bayes with PCA
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Naive Bayes
+
+cv_orig = NULL
+cv_pred = NULL
+nb_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "e1071") %dopar%{
+  train_Fold = pca_train[-flds[[i]],]
+  cv_Fold = pca_train[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+
+naiveBayes = naiveBayes(formula = train_Y[-flds[[i]]] ~ ., data = train_Fold)
+
+# Predict cross validation part
+preds = predict(naiveBayes, cv_Fold,type = "class",threshold = 0.01)
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+  
+# Get testing prediction
+preds = predict(naiveBayes, pca_test,type = "class",threshold = 0.01)
+preds = as.numeric(as.character(preds))
+  
+
+list(cv_orig = cv_orig, cv_pred = cv_pred, nb_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(tree_preds)){
+    nb_preds = res[[i]]$nb_preds
+  }else{
+    nb_preds = cbind(nb_preds,res[[i]]$nb_preds)
+  }
+}
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(nb_preds)
+Ypreds = data.frame(Ypreds,nb_pca = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Naive Bayes",var = "PCA",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Naive Bayes with PCA")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+## Random Forest
+Random Forest is known to be robust because it's an ensemble of week learners. So we fit all variables to random forest model.
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Random Forest
+
+cv_orig = NULL
+cv_pred = NULL
+rf_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "randomForest") %dopar%{
+  train_Fold = train_X[-flds[[i]],]
+  cv_Fold = train_X[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+
+rf <- randomForest(y = train_Y[-flds[[i]]],x = train_Fold, mtry = 100, data = train_Fold, ntree = 500, maxnodes = 15)
+
+# Predict cross validation part
+preds = predict(rf, cv_Fold,type = "class")
+cv_orig = as.numeric(as.character(cv_Y))
+cv_pred = as.numeric(as.character(preds))
+
+# Get testing prediction
+preds = predict(rf, test_X,type = "class")
+preds = as.numeric(as.character(preds))
+
+list(cv_orig = cv_orig, cv_pred = cv_pred, rf_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(tree_preds)){
+    rf_preds = res[[i]]$rf_preds
+  }else{
+    rf_preds = cbind(rf_preds,res[[i]]$rf_preds)
+  }
+}
+end_time = Sys.time()
+
+# Processing time
+end_time - start_time
+```
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(rf_preds)
+Ypreds = data.frame(Ypreds,rf = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Random Forest",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Random Forest")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation KNN
+
+cv_orig = NULL
+cv_pred = NULL
+knn_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "class") %dopar%{
+  train_Fold = train_X[-flds[[i]],]
+  cv_Fold = train_X[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+  
+  
+  # Predict cross validation part
+  preds = knn(train = train_Fold,
+             test = cv_Fold,
+             cl = train_Y[-flds[[i]]],
+             k = 5,
+             prob = F)
+  cv_orig = as.numeric(as.character(cv_Y))
+  cv_pred = as.numeric(as.character(preds))
+  
+  # Predict Test
+  preds = knn(train = train_Fold,
+             test = test_X,
+             cl = train_Y[-flds[[i]]],
+             k = 5,
+             prob = F)
+  preds = as.numeric(as.character(preds))
+  
+  list(cv_orig = cv_orig, cv_pred = cv_pred, knn_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(knn_preds)){
+    knn_preds = res[[i]]$knn_preds
+  }else{
+    knn_preds = cbind(knn_preds,res[[i]]$knn_preds)
+  }
+}
+end_time = Sys.time()
+```
+
+
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(knn_preds)
+Ypreds = data.frame(Ypreds,knn = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "KNN",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("K-Nearest Neighbour")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+
+
+
+
+
+
+
+### Adaboosting
+
+```{r}
+start_time = Sys.time()
+# 5-Fold cross validation Adaboost
+
+cv_orig = NULL
+cv_pred = NULL
+adb_preds = NULL # <- result holder to save test prediction
+res = foreach(i = 1:length(flds),.packages = "fastAdaboost") %dopar%{
+  train_Fold = train_X[-flds[[i]],]
+  cv_Fold = train_X[flds[[i]],]
+  cv_Y = train_Y[flds[[i]]]
+  train_Fold$Y = train_Y[-flds[[i]]]
+  adaboost = adaboost(formula = Y ~ ., data = train_Fold,nIter = 10)
+  
+  # Predict cross validation part
+  preds = predict(adaboost, cv_Fold)$class
+  cv_orig = as.numeric(as.character(cv_Y))
+  cv_pred = as.numeric(as.character(preds))
+  
+  # Get testing prediction
+  preds = predict(adaboost, test_X)$class
+  preds = as.numeric(as.character(preds))
+  
+  list(cv_orig = cv_orig, cv_pred = cv_pred, adb_preds = preds)
+}
+
+for(i in 1:length(res)){
+  cv_orig = c(cv_orig,res[[i]]$cv_orig)
+  cv_pred = c(cv_pred,res[[i]]$cv_pred)
+  if(is.null(adb_preds)){
+    adb_preds = res[[i]]$adb_preds
+  }else{
+    adb_preds = cbind(adb_preds,res[[i]]$adb_preds)
+  }
+}
+end_time = Sys.time()
+```
+
+
+
+```{r}
+# Evaluating the performance of our classifier on test data
+train_accuracy <- sum(cv_pred == cv_orig,1,0) / length(cv_orig)
+
+preds <- vote(adb_preds)
+Ypreds = data.frame(Ypreds,adb = preds) # <- Save for future use
+test_accuracy <- sum(preds == test_Y,1,0) / length(test_Y)
+
+result = rbind(result,
+               data.frame(type = "Adaboost",var = "Full",train_accuracy = train_accuracy, test_accuracy = test_accuracy,stringsAsFactors = F))
+
+sprintf("Adaboost")
+sprintf("Training accuracy: %.3f, Testing accuracy: %.3f", train_accuracy, test_accuracy)
+```
+
+### Result Summary
+
+```{r}
+result
+
+# Ensemble of all models
+fin = vote(Ypreds)
+test_accuracy <- sum(fin == test_Y,1,0) / length(test_Y)
+test_accuracy
+```
